@@ -77,6 +77,8 @@ namespace NaiwaDesktop
                 Check(form.FeedingBusy&&!form.Motion.Poking,"feeding waits for operation before feedback",log);
                 Check(drop.Effect==DragDropEffects.None,"async drop does not ask the source to delete again",log);
                 Check(!form.Laugh(),"busy recycling cannot overlap laughter",log);
+                Check(!form.SetManualHidden(true)&&!form.HiddenManually,"recycle operation keeps its owner window available",log);
+                Check(!form.SetClickThrough(true)&&!form.ClickThroughEnabled,"recycle operation cannot enable click-through mid-drop",log);
                 release.Set();PumpUntilIdle(form);
                 Check(workerSta&&!form.FeedingBusy&&!form.Motion.Poking,"failed STA recycle completes without success animation",log);
                 form.RecycleFiles=delegate(string[] paths,IntPtr owner)

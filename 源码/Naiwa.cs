@@ -57,7 +57,8 @@ namespace NaiwaDesktop
     {
         [STAThread] private static void Main(string[] args)
         {
-            Native.SetProcessDPIAware(); Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            // DPI awareness is selected by the manifest before any window exists.
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
             if(args.Length>=2 && args[0]=="--self-test") { Tests.Run(args[1]); return; }
             if(args.Length>=2 && args[0]=="--demo") { Tests.Demo(args[1]); return; }
             if(args.Length>=2 && args[0]=="--probe")
@@ -91,6 +92,7 @@ namespace NaiwaDesktop
         private readonly Bitmap[][] blinks;
         private readonly Dictionary<int,Bitmap> cache=new Dictionary<int,Bitmap>();
         private readonly Queue<int> order=new Queue<int>();
+        private readonly FramePrefetcher prefetch;
         internal readonly string AudioPath;
         internal int CacheCount{get{return cache.Count;}}
         internal Assets(string folder)
@@ -113,6 +115,7 @@ namespace NaiwaDesktop
             }
             // Warm up the first frames before the first double click.
             Frame(0);Frame(1);Frame(2);
+            prefetch=new FramePrefetcher(delegate(int index){return Decode(encoded[index]);});
         }
         private static byte[] Read(ZipArchive zip,string name)
         { ZipArchiveEntry entry=zip.GetEntry(name);if(entry==null)throw new InvalidDataException("缺少动作素材："+name);using(Stream s=entry.Open())using(MemoryStream m=new MemoryStream()){s.CopyTo(m);return m.ToArray();} }
@@ -122,7 +125,8 @@ namespace NaiwaDesktop
             {
                 if(image.Width!=Width||image.Height!=Height)throw new InvalidDataException("动作尺寸不一致");
                 Bitmap b=new Bitmap(Width,Height,PixelFormat.Format32bppPArgb);
-                using(Graphics g=Graphics.FromImage(b)){g.CompositingMode=CompositingMode.SourceCopy;g.DrawImageUnscaled(image,0,0);}return b;
+                try{using(Graphics g=Graphics.FromImage(b)){g.CompositingMode=CompositingMode.SourceCopy;g.DrawImageUnscaled(image,0,0);}return b;}
+                catch{b.Dispose();throw;}
             }
         }
         internal Bitmap Eye(double value){return eyes[Math.Max(0,Math.Min(EyeCount-1,(int)Math.Round(value*(EyeCount-1))))];}
@@ -130,11 +134,22 @@ namespace NaiwaDesktop
         internal Bitmap Frame(int index)
         {
             index=Math.Max(0,Math.Min(Count-1,index));Bitmap b;
-            if(cache.TryGetValue(index,out b))return b;
-            b=Decode(encoded[index]);cache.Add(index,b);order.Enqueue(index);
-            while(order.Count>12){int old=order.Dequeue();cache[old].Dispose();cache.Remove(old);}return b;
+            if(!cache.TryGetValue(index,out b))
+            {
+                b=prefetch==null?null:prefetch.Take(index);
+                if(b==null)b=Decode(encoded[index]);
+                cache.Add(index,b);order.Enqueue(index);
+                while(order.Count>12){int old=order.Dequeue();cache[old].Dispose();cache.Remove(old);}
+            }
+            if(prefetch!=null)
+            {
+                List<int> next=new List<int>(4);
+                for(int i=index+1;i<Count&&i<=index+4;i++)if(!cache.ContainsKey(i))next.Add(i);
+                prefetch.Request(next.ToArray());
+            }
+            return b;
         }
-        public void Dispose(){if(eyes!=null)foreach(Bitmap b in eyes)if(b!=null)b.Dispose();if(blinks!=null)foreach(Bitmap[] bank in blinks)foreach(Bitmap b in bank)if(b!=null)b.Dispose();foreach(Bitmap b in cache.Values)b.Dispose();cache.Clear();}
+        public void Dispose(){if(prefetch!=null)prefetch.Dispose();if(eyes!=null)foreach(Bitmap b in eyes)if(b!=null)b.Dispose();if(blinks!=null)foreach(Bitmap[] bank in blinks)foreach(Bitmap b in bank)if(b!=null)b.Dispose();foreach(Bitmap b in cache.Values)b.Dispose();cache.Clear();}
     }
 
     internal sealed class Motion
@@ -143,6 +158,7 @@ namespace NaiwaDesktop
         internal double Look,Start=-1,Elapsed,Clock,BlinkStart=-1,NextBlink=4,WakeStart=-1;
         internal double PokeStart=-1,PokeX=144,PokeY=205,LandingStart=-1,DragAngle,HeadPatStart=-1;
         internal bool Resting,Holding;
+        internal double BreathAmount;
         internal bool Playing{get{return Start>=0;}}
         internal bool Blinking{get{return BlinkStart>=0;}}
         internal bool Poking{get{return PokeStart>=0;}}
@@ -174,7 +190,7 @@ namespace NaiwaDesktop
             if(!Holding&&Math.Abs(DragAngle)<.02&&Math.Abs(dragVelocity)<.05){DragAngle=0;dragVelocity=0;}
         }
         private void ScheduleBlink(double now){NextBlink=now+4+random.NextDouble()*4;}
-        private void ClearEffects(double now){Clock=now;BlinkStart=PokeStart=HeadPatStart=WakeStart=LandingStart=-1;Holding=false;DragAngle=dragTarget=dragVelocity=0;ScheduleBlink(now);}
+        private void ClearEffects(double now){Clock=now;BlinkStart=PokeStart=HeadPatStart=WakeStart=LandingStart=-1;Holding=false;BreathAmount=0;DragAngle=dragTarget=dragVelocity=0;ScheduleBlink(now);}
         internal bool Laugh(double now){if(Playing)return false;ClearEffects(now);Resting=false;Start=now;Elapsed=0;PlayCount++;return true;}
         internal void Stop(){Start=-1;Elapsed=0;Resting=false;ClearEffects(Clock);}
         internal void Stand(double now){if(!Resting)return;Resting=false;ClearEffects(now);WakeStart=now;}
@@ -226,39 +242,19 @@ namespace NaiwaDesktop
         private Point lastClickPoint;
         private double lastClick=-100;
         private int lastClickZone;
-        internal void Down(Point p){Pressed=true;Dragged=false;Origin=p;}
-        internal void Move(Point p){if(Pressed&&(Math.Abs(p.X-Origin.X)>5||Math.Abs(p.Y-Origin.Y)>5))Dragged=true;}
+        private Size dragSize=SystemInformation.DragSize,doubleClickSize=SystemInformation.DoubleClickSize;
+        internal void Down(Point p){Down(p,SystemInformation.DragSize,SystemInformation.DoubleClickSize);}
+        internal void Down(Point p,Size drag,Size twice){Pressed=true;Dragged=false;Origin=p;dragSize=drag;doubleClickSize=twice;}
+        internal void Move(Point p)
+        {if(Pressed&&!new Rectangle(Origin.X-dragSize.Width/2,Origin.Y-dragSize.Height/2,Math.Max(1,dragSize.Width),Math.Max(1,dragSize.Height)).Contains(p))Dragged=true;}
         internal bool Up(Point p,double now,int zone=0)
         {
             if(!Pressed)return false;Pressed=false;
             if(Dragged){lastClick=-100;return false;}
-            bool twice=zone==lastClickZone&&now-lastClick<=SystemInformation.DoubleClickTime/1000.0&&Math.Abs(p.X-lastClickPoint.X)<=SystemInformation.DoubleClickSize.Width&&Math.Abs(p.Y-lastClickPoint.Y)<=SystemInformation.DoubleClickSize.Height;
+            bool twice=zone==lastClickZone&&now-lastClick<=SystemInformation.DoubleClickTime/1000.0&&Math.Abs(p.X-lastClickPoint.X)<=doubleClickSize.Width/2&&Math.Abs(p.Y-lastClickPoint.Y)<=doubleClickSize.Height/2;
             lastClick=twice?-100:now;lastClickPoint=p;lastClickZone=zone;return twice;
         }
         internal void Cancel(){Pressed=false;Dragged=false;lastClick=-100;}
-    }
-
-    internal sealed class Settings
-    {
-        internal int Scale=85,X,Y;internal bool Position,Sound,OnTop=true,AutoHide=true,FollowCursor=true,ConfirmFeeding=true;
-        internal static string Folder{get{return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"NaiwaDesktopPet");}}
-        internal static Settings Load()
-        {
-            Settings s=new Settings();try{
-                string file=Path.Combine(Folder,"settings.ini");if(!File.Exists(file))return s;
-                foreach(string line in File.ReadAllLines(file)){string[] p=line.Split('=');int n;if(p.Length!=2)continue;
-                    if(p[0]=="scale"&&int.TryParse(p[1],out n))s.Scale=Math.Max(50,Math.Min(150,n));
-                    if(p[0]=="x"&&int.TryParse(p[1],out n)){s.X=n;s.Position=true;}
-                    if(p[0]=="y"&&int.TryParse(p[1],out n))s.Y=n;
-                    if(p[0]=="sound")s.Sound=p[1]=="True";
-                    if(p[0]=="top")s.OnTop=p[1]!="False";
-                    if(p[0]=="fullscreen")s.AutoHide=p[1]!="False";
-                    if(p[0]=="gaze")s.FollowCursor=p[1]!="False";
-                    if(p[0]=="confirmFeeding")s.ConfirmFeeding=p[1]!="False";
-                }
-            }catch{}return s;
-        }
-        internal void Save(){try{Directory.CreateDirectory(Folder);File.WriteAllLines(Path.Combine(Folder,"settings.ini"),new string[]{"scale="+Scale,"x="+X,"y="+Y,"sound="+Sound,"top="+OnTop,"fullscreen="+AutoHide,"gaze="+FollowCursor,"confirmFeeding="+ConfirmFeeding});}catch{}}
     }
 
     internal sealed class LayeredSurface:IDisposable
@@ -300,6 +296,12 @@ namespace NaiwaDesktop
         {
             int w=assets.Width*scale/100,h=assets.Height*scale/100;
             Bitmap canvas=new Bitmap(w,h,PixelFormat.Format32bppPArgb);
+            try{RenderInto(canvas,assets,m,scale,gazeFrame,null);return canvas;}
+            catch{canvas.Dispose();throw;}
+        }
+        internal static void RenderInto(Bitmap canvas,Assets assets,Motion m,int scale,Bitmap gazeFrame,RenderWorkspace workspace)
+        {
+            int w=canvas.Width,h=canvas.Height;
             using(Graphics g=Graphics.FromImage(canvas))
             {
                 g.Clear(Color.Transparent);g.InterpolationMode=InterpolationMode.HighQualityBicubic;g.PixelOffsetMode=PixelOffsetMode.HighQuality;
@@ -309,6 +311,11 @@ namespace NaiwaDesktop
                     float px=w*.5f,py=h*(m.Holding?.56f:.9565f),s=(float)m.Squash;
                     g.TranslateTransform(px,py-(m.Holding?2f*scale/100:0));g.RotateTransform((float)m.DragAngle);
                     g.ScaleTransform(m.Holding?1.008f:1+s,m.Holding?1.018f:1-s);g.TranslateTransform(-px,-py);
+                }
+                else if(m.BreathAmount>0)
+                {
+                    float px=w*.5f,py=h*.9565f,breath=(float)m.BreathAmount;
+                    g.TranslateTransform(px,py);g.ScaleTransform(1-breath*.25f,1+breath);g.TranslateTransform(-px,-py);
                 }
                 Rectangle rect=new Rectangle(0,0,w,h);
                 if(m.Resting)Draw(g,assets.Frame(assets.Count-1),rect,1);
@@ -322,18 +329,30 @@ namespace NaiwaDesktop
                         if(blinkTime>=0&&blinkTime<assets.BlinkCount/assets.BlinkFps)idle=assets.Blink(0,(int)(blinkTime*assets.BlinkFps));
                         using(Bitmap pat=HeadPat.Render(idle,elapsed))Draw(g,pat,rect,1);
                     }
-                    else if(m.Poking)using(Bitmap poke=WarpBelly(idle,m.PokeX,m.PokeY,m.PokeAmount))Draw(g,poke,rect,1);else Draw(g,idle,rect,1);
+                    else if(m.Poking)
+                    {
+                        if(workspace!=null)Draw(g,workspace.WarpBelly(idle,m.PokeX,m.PokeY,m.PokeAmount),rect,1);
+                        else using(Bitmap poke=WarpBelly(idle,m.PokeX,m.PokeY,m.PokeAmount))Draw(g,poke,rect,1);
+                    }
+                    else Draw(g,idle,rect,1);
                 }
                 else if(m.Elapsed<.10){Draw(g,assets.Eye(m.Look),rect,1);Draw(g,assets.Frame((int)(m.Elapsed*assets.Fps)),rect,(float)(m.Elapsed/.10));}
                 else Draw(g,assets.Frame((int)(m.Elapsed*assets.Fps)),rect,1);
-            }return canvas;
+            }
         }
         internal static Bitmap WarpBelly(Bitmap original,double cx,double cy,double amount)
         {
-            int w=original.Width,h=original.Height;byte[] source=new byte[w*h*4];
+            int w=original.Width,h=original.Height;
+            Bitmap warped=new Bitmap(w,h,PixelFormat.Format32bppPArgb);
+            try{WarpBellyInto(original,cx,cy,amount,new byte[w*h*4],new byte[w*h*4],warped);return warped;}
+            catch{warped.Dispose();throw;}
+        }
+        internal static void WarpBellyInto(Bitmap original,double cx,double cy,double amount,byte[] source,byte[] result,Bitmap warped)
+        {
+            int w=original.Width,h=original.Height;
             BitmapData locked=original.LockBits(new Rectangle(0,0,w,h),ImageLockMode.ReadOnly,PixelFormat.Format32bppPArgb);
             try{Marshal.Copy(locked.Scan0,source,0,source.Length);}finally{original.UnlockBits(locked);}
-            byte[] result=(byte[])source.Clone();
+            Buffer.BlockCopy(source,0,result,0,source.Length);
             const double radiusX=96,radiusY=72;
             int left=Math.Max(0,(int)(cx-radiusX)),right=Math.Min(w-2,(int)(cx+radiusX)),top=Math.Max(105,(int)(cy-radiusY)),bottom=Math.Min(Math.Min(300,h-2),(int)(cy+radiusY));
             for(int y=top;y<=bottom;y++)for(int x=left;x<=right;x++)
@@ -348,8 +367,8 @@ namespace NaiwaDesktop
                 int dest=(y*w+x)*4,a=(iy*w+ix)*4,b=a+4,c=a+w*4,d=c+4;
                 for(int channel=0;channel<4;channel++)result[dest+channel]=(byte)Math.Max(0,Math.Min(255,(source[a+channel]*(1-fx)+source[b+channel]*fx)*(1-fy)+(source[c+channel]*(1-fx)+source[d+channel]*fx)*fy));
             }
-            Bitmap warped=new Bitmap(w,h,PixelFormat.Format32bppPArgb);locked=warped.LockBits(new Rectangle(0,0,w,h),ImageLockMode.WriteOnly,PixelFormat.Format32bppPArgb);
-            try{Marshal.Copy(result,0,locked.Scan0,result.Length);}finally{warped.UnlockBits(locked);}return warped;
+            locked=warped.LockBits(new Rectangle(0,0,w,h),ImageLockMode.WriteOnly,PixelFormat.Format32bppPArgb);
+            try{Marshal.Copy(result,0,locked.Scan0,result.Length);}finally{warped.UnlockBits(locked);}
         }
         private static void Draw(Graphics g,Bitmap b,Rectangle rect,float alpha)
         {
@@ -391,6 +410,7 @@ namespace NaiwaDesktop
         internal PetWindow(Assets a,bool test)
         {
             assets=a;testing=test;settings=testing?new Settings():Settings.Load();
+            windowDpi=testing?96:DesktopDpi.AtPoint(settings.Position?new Point(settings.X,settings.Y):Cursor.Position);
             gaze=new Gaze(assets.Eye(0));
             Text=Native.Title;FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;
             SetStyle(ControlStyles.UserPaint|ControlStyles.AllPaintingInWmPaint|ControlStyles.StandardClick|ControlStyles.StandardDoubleClick,true);
@@ -410,22 +430,25 @@ namespace NaiwaDesktop
             InitializeFeeding();
             if(!testing){tray=new NotifyIcon{Icon=petIcon,Text="奶蛙 · 点头摸摸 / 双击肚子笑 / 喂文件",ContextMenuStrip=menu,Visible=true};tray.DoubleClick+=delegate{ReturnHome();};}
             timer.Interval=16;timer.Tick+=delegate{Tick();};
-            Shown+=delegate{ready=true;RenderNow(true);if(!testing){CheckFullscreen(true);timer.Start();}};
+            Shown+=delegate{ready=true;InitializeDesktop();RenderNow(true);if(!testing){CheckFullscreen(true);timer.Start();}};
         }
         protected override bool ShowWithoutActivation{get{return true;}}
-        protected override CreateParams CreateParams{get{CreateParams p=base.CreateParams;p.ExStyle|=0x80000|0x80|0x08000000;p.ClassStyle|=8;return p;}}
+        protected override CreateParams CreateParams{get{CreateParams p=base.CreateParams;p.ExStyle|=0x80000|0x80|0x08000000;if(settings!=null&&settings.ClickThrough)p.ExStyle|=0x20;p.ClassStyle|=8;return p;}}
         protected override void WndProc(ref Message m)
         {
             if(m.Msg==Native.Wake){ReturnHome();return;}
-            if(m.Msg==Native.Status){m.Result=(IntPtr)(HiddenForFullscreen?4:Motion.Resting?3:Motion.Playing?2:Motion.Look>.5?1:0);return;}
+            if(m.Msg==Native.Status){m.Result=(IntPtr)(IsPetHidden?4:Motion.Resting?3:Motion.Playing?2:Motion.Look>.5?1:0);return;}
+            if(m.Msg==0x312&&m.WParam==(IntPtr)HideHotkey){SetManualHidden(!HiddenManually);return;}
+            if(m.Msg==0x2e0&&ready)
+            {Native.Rect r=(Native.Rect)Marshal.PtrToStructure(m.LParam,typeof(Native.Rect));ApplyDpi((int)(m.WParam.ToInt64()&0xffff),Rectangle.FromLTRB(r.Left,r.Top,r.Right,r.Bottom));return;}
             if(m.Msg==0x21){m.Result=(IntPtr)3;return;}
             if(m.Msg==0x84 && ready && !gesture.Pressed)
             {
                 long value=m.LParam.ToInt64();Point p=PointToClient(new Point((short)(value&0xffff),(short)((value>>16)&0xffff)));
-                m.Result=surface.Hit(p.X,p.Y)?(IntPtr)1:new IntPtr(-1);return;
+                m.Result=!settings.ClickThrough&&surface.Hit(p.X,p.Y)?(IntPtr)1:new IntPtr(-1);return;
             }
             base.WndProc(ref m);
-            if(m.Msg==0x7e && ready){KeepVisible();RenderNow(true);Save();}
+            if((m.Msg==0x7e||(m.Msg==0x1a&&m.WParam==(IntPtr)0x2f))&&ready){KeepVisible();RenderNow(true);Save();}
         }
         private ContextMenuStrip BuildMenu()
         {
@@ -442,6 +465,7 @@ namespace NaiwaDesktop
             fullscreenItem=new ToolStripMenuItem("全屏时自动隐藏",null,delegate{SetAutoHide(!settings.AutoHide);});result.Items.Add(fullscreenItem);
             gazeItem=new ToolStripMenuItem("目光跟随鼠标",null,delegate{settings.FollowCursor=!settings.FollowCursor;gaze.Reset();Save();UpdateMenu();RenderNow(true);});result.Items.Add(gazeItem);
             confirmFeedingItem=new ToolStripMenuItem("投喂文件前确认",null,delegate{settings.ConfirmFeeding=!settings.ConfirmFeeding;Save();UpdateMenu();});result.Items.Add(confirmFeedingItem);
+            AddDesktopMenu(result);
             result.Items.Add("回到屏幕右下角",null,delegate{ReturnHome();});
             result.Items.Add("打开使用说明",null,delegate{OpenHelp();});
             result.Items.Add(new ToolStripSeparator());result.Items.Add("退出奶蛙",null,delegate{Close();});
@@ -450,6 +474,7 @@ namespace NaiwaDesktop
         private void UpdateMenu()
         {
             if(menu==null)return;SetToggleMark(soundItem,settings.Sound);soundItem.Enabled=sound!=null;SetToggleMark(topItem,TopMost);stopItem.Enabled=Motion.Playing||Motion.Resting;SetToggleMark(fullscreenItem,settings.AutoHide);SetToggleMark(gazeItem,settings.FollowCursor);SetToggleMark(confirmFeedingItem,settings.ConfirmFeeding);
+            UpdateDesktopMenu();
             foreach(ToolStripItem entry in menu.Items){ToolStripMenuItem p=entry as ToolStripMenuItem;if(p==null)continue;foreach(ToolStripItem child in p.DropDownItems){ToolStripMenuItem c=child as ToolStripMenuItem;if(c!=null&&c.Tag is int)c.Checked=(int)c.Tag==settings.Scale;}}
         }
         private static void SetToggleMark(ToolStripMenuItem item,bool selected)
@@ -467,7 +492,7 @@ namespace NaiwaDesktop
         }
         internal bool Laugh()
         {
-            if(HiddenForFullscreen||FeedingBusy)return false;
+            if(IsPetHidden||FeedingBusy)return false;
             if(!Motion.Laugh(Now))return false;
             if(sound!=null&&settings.Sound&&!testing)
             {
@@ -478,28 +503,32 @@ namespace NaiwaDesktop
         }
         internal void StopLaugh(){Motion.Stop();if(sound!=null)sound.Stop();RenderNow(true);}
         internal void Tick()
-        { TickWithForeground(Native.GetForegroundWindow()); }
+        { TickCore(IntPtr.Zero,false); }
         internal void TickWithForeground(IntPtr foreground)
+        { TickCore(foreground,true); }
+        private void TickCore(IntPtr foreground,bool suppliedForeground)
         {
-            if(Now>=nextFullscreenCheck){nextFullscreenCheck=Now+.12;CheckFullscreenWindow(foreground,false);}
-            if(HiddenForFullscreen)return;
-            Point p=PointToClient(Cursor.Position);bool over=!menuOpen&&surface.Hit(p.X,p.Y);
-            if(settings.FollowCursor)gaze.Update(Now,Cursor.Position,Bounds);
-            bool wasPlaying=Motion.Playing;Motion.Update(Now,settings.FollowCursor?false:over,assets.Duration,assets.BlinkCount/assets.BlinkFps);
+            double now=Now;
+            if(now>=nextFullscreenCheck){nextFullscreenCheck=now+.12;CheckFullscreenWindow(suppliedForeground?foreground:Native.GetForegroundWindow(),false);}
+            if(IsPetHidden){timer.Interval=150;return;}
+            Point pointer=Cursor.Position,p=PointToClient(pointer);bool over=!menuOpen&&!settings.ClickThrough&&surface.Hit(p.X,p.Y);
+            bool gazeChanged=settings.FollowCursor&&gaze.Update(now,pointer,Bounds);
+            bool wasPlaying=Motion.Playing;Motion.Update(now,settings.FollowCursor?false:over,assets.Duration,assets.BlinkCount/assets.BlinkFps);
             if(wasPlaying&&!Motion.Playing&&sound!=null)sound.Stop();
+            UpdateCadence(now,pointer,over,gazeChanged);
             RenderNow(false);
         }
         internal void RenderNow(bool force)
         {
-            if(!IsHandleCreated||disposing||HiddenForFullscreen)return;
+            if(!IsHandleCreated||disposing||IsPetHidden)return;
             string key=Motion.Resting?"R":Motion.Playing?"L"+(int)(Motion.Elapsed*assets.Fps):Motion.Blinking?"B"+(Motion.Look>.5?1:0)+"/"+(int)((Motion.Clock-Motion.BlinkStart)*assets.BlinkFps):"E"+(int)Math.Round(Motion.Look*(assets.EyeCount-1));
             if(Motion.Poking||Motion.Patting||Motion.Moving||Motion.Waking)key+="/M"+(int)(Motion.Clock*60);
-            key+="/"+settings.Scale;
+            key+="/"+RenderScale+"/Q"+(int)Math.Round(Motion.BreathAmount*10000);
             if(settings.FollowCursor&&!Motion.Playing&&!Motion.Resting&&!Motion.Blinking)key+="/G"+gaze.VisualKey;
             key+=FeedingVisualKey;
             if(!force&&key==lastVisual)return;
-            using(Bitmap frame=Renderer.Render(assets,Motion,settings.Scale,settings.FollowCursor?gaze.Frame:null))
-            {DrawFeeding(frame);surface.Update(Handle,frame,Location);}
+            Bitmap frame=renderWorkspace.Render(assets,Motion,RenderScale,settings.FollowCursor?gaze.Frame:null);
+            DrawFeeding(frame);surface.Update(Handle,frame,Location);
             lastVisual=key;
         }
         internal void SetAutoHide(bool value)
@@ -521,18 +550,10 @@ namespace NaiwaDesktop
         {
             if(hidden==HiddenForFullscreen)return;
             HiddenForFullscreen=hidden;
-            if(hidden)
-            {
-                gesture.Cancel();Capture=false;Motion.Suspend(Now);if(sound!=null)sound.Stop();
-                Hide();timer.Interval=150;
-            }
-            else
-            {
-                Motion.Suspend(Now);timer.Interval=16;Show();RenderNow(true);
-            }
+            ApplyVisibility();
         }
-        private void ReturnHome(){Home();if(!testing)CheckFullscreen(true);if(!HiddenForFullscreen){Show();RenderNow(true);}Save();}
-        private Size SizeFor(int scale){return new Size(assets.Width*scale/100,assets.Height*scale/100);}
+        internal void ReturnHome(){if(FeedingBusy)return;HiddenManually=false;SetClickThrough(false);Home();if(!testing)CheckFullscreen(true);if(!IsPetHidden){Show();RenderNow(true);}Save();UpdateMenu();}
+        private Size SizeFor(int scale){int effective=DesktopDpi.RenderScale(scale,windowDpi);return new Size(assets.Width*effective/100,assets.Height*effective/100);}
         internal void SetSize(int scale)
         {
             int center=Left+Width/2,bottom=Top+Height;settings.Scale=Math.Max(50,Math.Min(150,scale));ClientSize=SizeFor(settings.Scale);
@@ -540,26 +561,34 @@ namespace NaiwaDesktop
         }
         internal void Home()
         {
+            if(!testing){windowDpi=DesktopDpi.AtPoint(Cursor.Position);ClientSize=SizeFor(settings.Scale);}
             Rectangle area=Screen.FromPoint(Cursor.Position).WorkingArea;
-            Location=new Point(area.Right-Width-24,area.Bottom-Height+(int)(12*settings.Scale/100.0));KeepVisible();
+            Location=new Point(area.Right-Width-(int)(24*windowDpi/96.0),area.Bottom-Height+(int)(12*RenderScale/100.0));KeepVisible();
         }
         internal static Point Clamp(Point p,Size size,Rectangle area,int allowance)
         {return new Point(Math.Max(area.Left,Math.Min(p.X,area.Right-size.Width)),Math.Max(area.Top,Math.Min(p.Y,area.Bottom-size.Height+allowance)));}
-        private void KeepVisible(){Location=Clamp(Location,Size,Screen.FromRectangle(Bounds).WorkingArea,(int)(12*settings.Scale/100.0));}
-        private void Save(){if(testing)return;settings.X=Left;settings.Y=Top;settings.Save();}
+        private void KeepVisible(){Location=Clamp(Location,Size,Screen.FromRectangle(Bounds).WorkingArea,(int)(12*RenderScale/100.0));}
+        private void Save()
+        {
+            if(testing)return;settings.X=Left;settings.Y=Top;settings.Position=true;
+            if(settings.Save())saveWarningShown=false;
+            else if(!saveWarningShown){saveWarningShown=true;Notify("设置暂时无法保存，本次运行仍可继续使用。\n"+settings.LastSaveError);}
+        }
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if(FeedingBusy)return;
+            if(FeedingBusy||IsPetHidden||settings.ClickThrough)return;
+            timer.Interval=16;
             if(e.Button==MouseButtons.Right){Motion.EndDrag(Now);gesture.Cancel();Capture=false;menu.Show(this,e.Location);return;}
             if(e.Button!=MouseButtons.Left)return;
-            gesture.Down(PointToScreen(e.Location));lastDragPointer=gesture.Origin;dragWindow=Location;Capture=true;
+            gesture.Down(PointToScreen(e.Location),DesktopDpi.DragSize(windowDpi),DesktopDpi.DoubleClickSize(windowDpi));lastDragPointer=gesture.Origin;dragWindow=Location;Capture=true;
         }
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);if(!gesture.Pressed)return;Point p=PointToScreen(e.Location);gesture.Move(p);
             if(gesture.Dragged)
             {
+                if(settings.LockPosition)return;
                 if(!Motion.Holding){Motion.BeginDrag(Now);if(sound!=null)sound.Stop();}
                 Motion.Drag(Now,p.X-lastDragPointer.X);lastDragPointer=p;
                 Location=new Point(dragWindow.X+p.X-gesture.Origin.X,dragWindow.Y+p.Y-gesture.Origin.Y);RenderNow(true);
@@ -568,7 +597,7 @@ namespace NaiwaDesktop
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);if(e.Button!=MouseButtons.Left||!gesture.Pressed)return;
-            double x=e.X*100.0/settings.Scale,y=e.Y*100.0/settings.Scale;
+            PointF artwork=DesktopDpi.ToArtwork(e.Location,ClientSize,assets.Width,assets.Height);double x=artwork.X,y=artwork.Y;
             int zone=HeadPat.Contains(x,y)?1:Motion.InBelly(x,y)?2:0;
             bool moved=gesture.Dragged,twice=gesture.Up(PointToScreen(e.Location),Now,zone);Capture=false;
             if(moved){Motion.EndDrag(Now);KeepVisible();RenderNow(true);Save();}
@@ -581,7 +610,7 @@ namespace NaiwaDesktop
         protected override void OnFormClosing(FormClosingEventArgs e){if(FeedingBusy&&e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Notify("正在把文件送入回收站，请稍后再退出。");return;}Save();timer.Stop();if(sound!=null)sound.Stop();base.OnFormClosing(e);}
         protected override void Dispose(bool disposingNow)
         {
-            if(disposingNow&&!disposing){disposing=true;timer.Dispose();if(tray!=null){tray.Visible=false;tray.Dispose();}if(menu!=null){Font f=menu.Font;menu.Dispose();f.Dispose();}if(sound!=null){sound.Stop();sound.Dispose();}gaze.Dispose();surface.Dispose();if(petIcon!=null)petIcon.Dispose();}
+            if(disposingNow&&!disposing){disposing=true;timer.Dispose();if(tray!=null){tray.Visible=false;tray.Dispose();}if(menu!=null){Font f=menu.Font;menu.Dispose();f.Dispose();}if(sound!=null){sound.Stop();sound.Dispose();}gaze.Dispose();renderWorkspace.Dispose();surface.Dispose();if(petIcon!=null)petIcon.Dispose();}
             base.Dispose(disposingNow);
         }
     }
@@ -698,9 +727,13 @@ namespace NaiwaDesktop
                         form.Motion.Stop();form.RenderNow(true);form.Close();Check(form.IsDisposed,"window closes cleanly",log);
                     }
                     FeatureTests.Run(a,folder,log);
+                    DesktopTests.Run(a,folder,log);
+                    SettingsTests.Run(folder,log);
+                    RenderingTests.Run(a,log);
                     using(Icon icon=Renderer.CreateIcon(a.Eye(0)))using(FileStream f=File.Create(Path.Combine(folder,"naiwa.ico")))icon.Save(f);
                     m=new Motion();
                     using(Bitmap b=Renderer.Render(a,m,100))b.Save(Path.Combine(folder,"native-idle.png"),ImageFormat.Png);
+                    m.BreathAmount=.006;using(Bitmap b=Renderer.Render(a,m,100))b.Save(Path.Combine(folder,"native-breath.png"),ImageFormat.Png);m.BreathAmount=0;
                     m.Look=1;using(Bitmap b=Renderer.Render(a,m,100))b.Save(Path.Combine(folder,"native-hover.png"),ImageFormat.Png);
                     m.Laugh(0);m.Elapsed=1;using(Bitmap b=Renderer.Render(a,m,100))b.Save(Path.Combine(folder,"native-laugh.png"),ImageFormat.Png);
                     m=new Motion();m.Poke(0,144,211);m.Update(.10,false,a.Duration,blinkDuration);using(Bitmap b=Renderer.Render(a,m,100))b.Save(Path.Combine(folder,"native-poke.png"),ImageFormat.Png);

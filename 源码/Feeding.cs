@@ -48,7 +48,7 @@ namespace NaiwaDesktop
                 return "/F"+feedMessage+(feedSucceeded&&age<.8?"/"+(int)(age*30):"");
             }
         }
-        private void InitializeFeeding(){AllowDrop=true;}
+        private void InitializeFeeding(){AllowDrop=!settings.ClickThrough;}
         private void Notify(string message)
         {
             if(testing)return;
@@ -81,7 +81,7 @@ namespace NaiwaDesktop
         protected override void OnDragEnter(DragEventArgs e)
         {
             base.OnDragEnter(e);e.Effect=DragDropEffects.None;
-            if(FeedingBusy||HiddenForFullscreen)return;
+            if(FeedingBusy||IsPetHidden||settings.ClickThrough)return;
             string error;string[] paths=CheckDrop(e,out error);
             feedHover=true;feedSucceeded=false;
             feedResultTime=-100;
@@ -95,7 +95,7 @@ namespace NaiwaDesktop
         {
             base.OnDragOver(e);
             // Reuse the validated hover state; filesystem work is done on enter and drop.
-            e.Effect=feedHover&&!FeedingBusy&&feedCanAccept&&(e.AllowedEffect&DragDropEffects.Move)!=0?
+            e.Effect=feedHover&&!FeedingBusy&&!IsPetHidden&&!settings.ClickThrough&&feedCanAccept&&(e.AllowedEffect&DragDropEffects.Move)!=0?
                 DragDropEffects.Move:DragDropEffects.None;
         }
         protected override void OnDragLeave(EventArgs e)
@@ -107,7 +107,7 @@ namespace NaiwaDesktop
         internal void AcceptFileDrop(DragEventArgs e)
         {
             e.Effect=DragDropEffects.None;feedHover=false;
-            if(FeedingBusy||HiddenForFullscreen){RenderNow(true);return;}
+            if(FeedingBusy||IsPetHidden||settings.ClickThrough){RenderNow(true);return;}
             string error;string[] paths=CheckDrop(e,out error);
             if(error!=null){FeedFailed(error);return;}
             if((e.AllowedEffect&DragDropEffects.Move)==0){FeedFailed("来源不允许移动此文件。");return;}
@@ -156,11 +156,10 @@ namespace NaiwaDesktop
         {
             double age=Now-feedResultTime;
             if(!feedHover&&!feedBusy&&age>=3)return;
-            float scale=settings.Scale/100f;
             using(Graphics g=Graphics.FromImage(frame))
             {
                 g.SmoothingMode=SmoothingMode.AntiAlias;
-                g.ScaleTransform(scale,scale);
+                g.ScaleTransform(frame.Width/(float)assets.Width,frame.Height/(float)assets.Height);
                 using(Brush background=new SolidBrush(Color.FromArgb(225,37,47,35)))
                 using(Brush foreground=new SolidBrush(Color.White))
                 using(Font font=new Font("Microsoft YaHei UI",10f,FontStyle.Regular,GraphicsUnit.Pixel))
